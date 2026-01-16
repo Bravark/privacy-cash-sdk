@@ -53,6 +53,19 @@ async function relayDepositToIndexer(signedTransaction: string, publicKey: Publi
     }
 }
 
+export type UnsignedDepositResult = {
+    unsignedTransaction: VersionedTransaction;
+    metadata: {
+        encryptedOutput1: Buffer;
+        publicKey: PublicKey;
+        referrer?: string;
+    }
+}
+
+export type SignedDepositResult = {
+    tx: string;
+}
+
 type DepositParams = {
     publicKey: PublicKey,
     connection: Connection,
@@ -63,9 +76,9 @@ type DepositParams = {
     lightWasm: hasher.LightWasm,
     referrer?: string,
     signer?: PublicKey,
-    transactionSigner: (tx: VersionedTransaction) => Promise<VersionedTransaction>
+    transactionSigner?: (tx: VersionedTransaction) => Promise<VersionedTransaction>
 }
-export async function deposit({ lightWasm, storage, keyBasePath, publicKey, connection, amount_in_lamports, encryptionService, transactionSigner, referrer, signer }: DepositParams) {
+export async function deposit({ lightWasm, storage, keyBasePath, publicKey, connection, amount_in_lamports, encryptionService, transactionSigner, referrer, signer }: DepositParams): Promise<UnsignedDepositResult | SignedDepositResult> {
     // check limit
     let limitAmount = await checkDepositLimit(connection)
 
@@ -401,6 +414,19 @@ export async function deposit({ lightWasm, storage, keyBasePath, publicKey, conn
     }).compileToV0Message([lookupTableAccount.value]);
 
     let versionedTransaction = new VersionedTransaction(messageV0);
+
+    // If no transaction signer provided, return unsigned transaction
+    if (!transactionSigner) {
+        logger.debug('No transaction signer provided, returning unsigned transaction');
+        return {
+            unsignedTransaction: versionedTransaction,
+            metadata: {
+                encryptedOutput1: encryptedOutput1,
+                publicKey: signer,
+                referrer
+            }
+        };
+    }
 
     // sign tx
     versionedTransaction = await transactionSigner(versionedTransaction)

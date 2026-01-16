@@ -1,9 +1,9 @@
 import { Connection, Keypair, LAMPORTS_PER_SOL, PublicKey, VersionedTransaction } from '@solana/web3.js';
-import { deposit } from './deposit.js';
+import { deposit, type UnsignedDepositResult, type SignedDepositResult } from './deposit.js';
 import { getBalanceFromUtxos, getUtxos, localstorageKey } from './getUtxos.js';
 import { getBalanceFromUtxosSPL, getUtxosSPL } from './getUtxosSPL.js';
 
-import { LSK_ENCRYPTED_OUTPUTS, LSK_FETCH_OFFSET, SplList, TokenList, tokens, USDC_MINT } from './utils/constants.js';
+import { LSK_ENCRYPTED_OUTPUTS, LSK_FETCH_OFFSET, SplList, TokenList, tokens, USDC_MINT, RELAYER_API_URL } from './utils/constants.js';
 import { logger, type LoggerFn, setLogger } from './utils/logger.js';
 import { EncryptionService } from './utils/encryption.js';
 import { WasmFactory } from '@lightprotocol/hasher.rs';
@@ -11,11 +11,16 @@ import bs58 from 'bs58'
 import { withdraw } from './withdraw.js';
 import { LocalStorage } from "node-localstorage";
 import path from 'node:path'
-import { depositSPL } from './depositSPL.js';
+import { depositSPL, type UnsignedDepositSPLResult, type SignedDepositSPLResult } from './depositSPL.js';
 import { withdrawSPL } from './withdrawSPL.js';
 import { getAssociatedTokenAddress } from '@solana/spl-token';
+import { Buffer } from 'buffer';
 
 let storage = new LocalStorage(path.join(process.cwd(), "cache"));
+
+// Export types for external use
+export type { UnsignedDepositResult, SignedDepositResult } from './deposit.js';
+export type { UnsignedDepositSPLResult, SignedDepositSPLResult } from './depositSPL.js';
 
 export class PrivacyCash {
     private connection: Connection
@@ -83,12 +88,15 @@ export class PrivacyCash {
 
     /**
      * Deposit SOL to the Privacy Cash.
-     * 
+     *
      * Lamports is the amount of SOL in lamports. e.g. if you want to deposit 0.01 SOL (10000000 lamports), call deposit({ lamports: 10000000 })
+     *
+     * @param returnUnsigned - If true, returns an unsigned transaction that can be signed externally. If false or undefined, signs and submits the transaction automatically.
      */
-    async deposit({ lamports }: {
-        lamports: number
-    }) {
+    async deposit({ lamports, returnUnsigned }: {
+        lamports: number,
+        returnUnsigned?: boolean
+    }): Promise<UnsignedDepositResult | SignedDepositResult> {
         this.isRuning = true
         logger.info('start depositting')
         let lightWasm = await WasmFactory.getInstance()
@@ -98,7 +106,7 @@ export class PrivacyCash {
             connection: this.connection,
             encryptionService: this.encryptionService,
             publicKey: this.publicKey,
-            transactionSigner: async (tx: VersionedTransaction) => {
+            transactionSigner: returnUnsigned ? undefined : async (tx: VersionedTransaction) => {
                 tx.sign([this.keypair])
                 return tx
             },
@@ -111,10 +119,13 @@ export class PrivacyCash {
 
     /**
     * Deposit USDC to the Privacy Cash.
+    *
+    * @param returnUnsigned - If true, returns an unsigned transaction that can be signed externally. If false or undefined, signs and submits the transaction automatically.
     */
-    async depositUSDC({ base_units }: {
-        base_units: number
-    }) {
+    async depositUSDC({ base_units, returnUnsigned }: {
+        base_units: number,
+        returnUnsigned?: boolean
+    }): Promise<UnsignedDepositSPLResult | SignedDepositSPLResult> {
         this.isRuning = true
         logger.info('start depositting')
         let lightWasm = await WasmFactory.getInstance()
@@ -125,7 +136,7 @@ export class PrivacyCash {
             connection: this.connection,
             encryptionService: this.encryptionService,
             publicKey: this.publicKey,
-            transactionSigner: async (tx: VersionedTransaction) => {
+            transactionSigner: returnUnsigned ? undefined : async (tx: VersionedTransaction) => {
                 tx.sign([this.keypair])
                 return tx
             },
@@ -257,12 +268,15 @@ export class PrivacyCash {
 
     /**
    * Deposit SPL to the Privacy Cash.
+   *
+   * @param returnUnsigned - If true, returns an unsigned transaction that can be signed externally. If false or undefined, signs and submits the transaction automatically.
    */
-    async depositSPL({ base_units, mintAddress, amount }: {
+    async depositSPL({ base_units, mintAddress, amount, returnUnsigned }: {
         base_units?: number,
         amount?: number,
-        mintAddress: PublicKey | string
-    }) {
+        mintAddress: PublicKey | string,
+        returnUnsigned?: boolean
+    }): Promise<UnsignedDepositSPLResult | SignedDepositSPLResult> {
         this.isRuning = true
         logger.info('start depositting')
         let lightWasm = await WasmFactory.getInstance()
@@ -273,7 +287,7 @@ export class PrivacyCash {
             connection: this.connection,
             encryptionService: this.encryptionService,
             publicKey: this.publicKey,
-            transactionSigner: async (tx: VersionedTransaction) => {
+            transactionSigner: returnUnsigned ? undefined : async (tx: VersionedTransaction) => {
                 tx.sign([this.keypair])
                 return tx
             },
@@ -316,6 +330,154 @@ export class PrivacyCash {
         logger.debug(`Withdraw successful. Recipient ${recipient} received ${base_units} USDC units`)
         this.isRuning = false
         return res
+    }
+
+    /**
+     * Submit a signed SOL deposit transaction to the relayer.
+     *
+     * This method is used after obtaining an unsigned transaction from deposit() with returnUnsigned=true,
+     * signing it externally (e.g., on the frontend), and then submitting it to the relayer.
+     *
+     * @param signedTransaction - The signed VersionedTransaction
+     * @param metadata - Metadata returned from the unsigned deposit call
+     */
+    async submitSignedDeposit(
+        signedTransaction: VersionedTransaction,
+        metadata: UnsignedDepositResult['metadata']
+    ): Promise<{ tx: string }> {
+        this.isRuning = true
+        logger.info('submitting signed deposit transaction to relayer...')
+
+        const serializedTransaction = Buffer.from(signedTransaction.serialize()).toString('base64');
+
+        const params: any = {
+            signedTransaction: serializedTransaction,
+            senderAddress: metadata.publicKey.toString()
+        };
+
+        if (metadata.referrer) {
+            params.referralWalletAddress = metadata.referrer;
+        }
+
+        const response = await fetch(`${RELAYER_API_URL}/deposit`, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+            },
+            body: JSON.stringify(params)
+        });
+
+        if (!response.ok) {
+            logger.error('res text:', await response.text())
+            throw new Error('response not ok')
+        }
+
+        const result = await response.json() as { signature: string, success: boolean };
+        logger.debug('Pre-signed deposit transaction relayed successfully!');
+        logger.debug('Transaction signature:', result.signature);
+
+        logger.info('Waiting for transaction confirmation...')
+
+        let retryTimes = 0
+        let itv = 2
+        const encryptedOutputStr = Buffer.from(metadata.encryptedOutput1).toString('hex')
+        let start = Date.now()
+        while (true) {
+            logger.info('Confirming transaction..')
+            logger.debug(`retryTimes: ${retryTimes}`)
+            await new Promise(resolve => setTimeout(resolve, itv * 1000));
+            logger.debug('Fetching updated tree state...');
+            let res = await fetch(RELAYER_API_URL + '/utxos/check/' + encryptedOutputStr)
+            let resJson = await res.json()
+            if (resJson.exists) {
+                logger.debug(`Top up successfully in ${((Date.now() - start) / 1000).toFixed(2)} seconds!`);
+                this.isRuning = false
+                return { tx: result.signature }
+            }
+            if (retryTimes >= 10) {
+                this.isRuning = false
+                throw new Error('Refresh the page to see latest balance.')
+            }
+            retryTimes++
+        }
+    }
+
+    /**
+     * Submit a signed SPL deposit transaction to the relayer.
+     *
+     * This method is used after obtaining an unsigned transaction from depositUSDC() or depositSPL() with returnUnsigned=true,
+     * signing it externally (e.g., on the frontend), and then submitting it to the relayer.
+     *
+     * @param signedTransaction - The signed VersionedTransaction
+     * @param metadata - Metadata returned from the unsigned deposit call
+     */
+    async submitSignedDepositSPL(
+        signedTransaction: VersionedTransaction,
+        metadata: UnsignedDepositSPLResult['metadata']
+    ): Promise<{ tx: string }> {
+        this.isRuning = true
+        logger.info('submitting signed SPL deposit transaction to relayer...')
+
+        const serializedTransaction = Buffer.from(signedTransaction.serialize()).toString('base64');
+
+        const params: any = {
+            signedTransaction: serializedTransaction,
+            senderAddress: metadata.publicKey.toString(),
+            mintAddress: metadata.mintAddress
+        };
+
+        if (metadata.referrer) {
+            params.referralWalletAddress = metadata.referrer;
+        }
+
+        const response = await fetch(`${RELAYER_API_URL}/deposit/spl`, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+            },
+            body: JSON.stringify(params)
+        });
+
+        if (!response.ok) {
+            logger.debug('res text:', await response.text())
+            throw new Error('response not ok')
+        }
+
+        const result = await response.json() as { signature: string, success: boolean };
+        logger.debug('Pre-signed SPL deposit transaction relayed successfully!');
+        logger.debug('Transaction signature:', result.signature);
+
+        logger.info('Waiting for transaction confirmation...')
+
+        // Find the token to get its name for the confirmation check
+        let token = tokens.find(t => t.pubkey.toString() === metadata.mintAddress);
+        if (!token) {
+            throw new Error('Token not found: ' + metadata.mintAddress);
+        }
+
+        let retryTimes = 0
+        let itv = 2
+        const encryptedOutputStr = Buffer.from(metadata.encryptedOutput1).toString('hex')
+        let start = Date.now()
+        while (true) {
+            logger.info('Confirming transaction..')
+            logger.debug(`retryTimes: ${retryTimes}`)
+            await new Promise(resolve => setTimeout(resolve, itv * 1000));
+            logger.debug('Fetching updated tree state...');
+            let url = RELAYER_API_URL + '/utxos/check/' + encryptedOutputStr + '?token=' + token.name
+            let res = await fetch(url)
+            let resJson = await res.json()
+            if (resJson.exists) {
+                logger.debug(`Top up successfully in ${((Date.now() - start) / 1000).toFixed(2)} seconds!`);
+                this.isRuning = false
+                return { tx: result.signature }
+            }
+            if (retryTimes >= 10) {
+                this.isRuning = false
+                throw new Error('Refresh the page to see latest balance.')
+            }
+            retryTimes++
+        }
     }
 
 

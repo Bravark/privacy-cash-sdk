@@ -66,6 +66,20 @@ async function relayDepositToIndexer({ signedTransaction, publicKey, referrer, m
     }
 }
 
+export type UnsignedDepositSPLResult = {
+    unsignedTransaction: VersionedTransaction;
+    metadata: {
+        encryptedOutput1: Buffer;
+        publicKey: PublicKey;
+        referrer?: string;
+        mintAddress: string;
+    }
+}
+
+export type SignedDepositSPLResult = {
+    tx: string;
+}
+
 type DepositParams = {
     mintAddress: PublicKey | string,
     publicKey: PublicKey,
@@ -78,9 +92,9 @@ type DepositParams = {
     lightWasm: hasher.LightWasm,
     referrer?: string,
     signer?: PublicKey,
-    transactionSigner: (tx: VersionedTransaction) => Promise<VersionedTransaction>
+    transactionSigner?: (tx: VersionedTransaction) => Promise<VersionedTransaction>
 }
-export async function depositSPL({ lightWasm, storage, keyBasePath, publicKey, connection, base_units, amount, encryptionService, transactionSigner, referrer, mintAddress, signer }: DepositParams) {
+export async function depositSPL({ lightWasm, storage, keyBasePath, publicKey, connection, base_units, amount, encryptionService, transactionSigner, referrer, mintAddress, signer }: DepositParams): Promise<UnsignedDepositSPLResult | SignedDepositSPLResult> {
     if (typeof mintAddress == 'string') {
         mintAddress = new PublicKey(mintAddress)
     }
@@ -486,6 +500,20 @@ export async function depositSPL({ lightWasm, storage, keyBasePath, publicKey, c
 
 
     let versionedTransaction = new VersionedTransaction(messageV0);
+
+    // If no transaction signer provided, return unsigned transaction
+    if (!transactionSigner) {
+        logger.debug('No transaction signer provided, returning unsigned transaction');
+        return {
+            unsignedTransaction: versionedTransaction,
+            metadata: {
+                encryptedOutput1: encryptedOutput1,
+                publicKey: signer,
+                referrer,
+                mintAddress: token.pubkey.toString()
+            }
+        };
+    }
 
     // sign tx
     versionedTransaction = await transactionSigner(versionedTransaction)
